@@ -24,7 +24,7 @@ KST = ZoneInfo("Asia/Seoul")
 
 # 통화 기호 -> 통화 코드 (긴 기호가 먼저 와야 "US$"가 "$"보다 먼저 매칭됨)
 CURRENCY_SYMBOLS = {
-    "US$": "USD", "CA$": "CAD", "A$": "AUD", "HK$": "HKD", "NT$": "TWD",
+    "JP¥": "JPY", "US$": "USD", "CA$": "CAD", "A$": "AUD", "HK$": "HKD", "NT$": "TWD",
     "₩": "KRW", "$": "USD", "¥": "JPY", "￥": "JPY", "€": "EUR", "£": "GBP",
 }
 CURRENCY_CODES = {"KRW", "USD", "JPY", "EUR", "GBP", "CAD", "AUD", "HKD", "TWD"}
@@ -32,7 +32,11 @@ CURRENCY_CODES = {"KRW", "USD", "JPY", "EUR", "GBP", "CAD", "AUD", "HKD", "TWD"}
 ZERO_DECIMAL = {"KRW", "JPY", "TWD"}
 
 # 이미 알고 있는 결제수단. 여기 없는 종류가 나오면 경고합니다. 필요하면 추가하세요.
-KNOWN_METHODS = {"신한 Visa 신용", "토스", "Google Play 잔액", "Google Play 기프트 카드"}
+KNOWN_METHODS = {"토스", "신한", "비씨", "Visa", "UnionPay", "KT 휴대폰", "NAVER Pay",
+                 "Google Play 잔액", "Google Play 기프트 카드"}
+# 표기 통일 (정리한 뒤의 이름 -> 최종 이름)
+METHOD_ALIASES = {"Toss": "토스", "KT": "KT 휴대폰", "Korea Telecom KR": "KT 휴대폰",
+                  "Korea Telecom": "KT 휴대폰"}
 
 # 결과물에 남아 있으면 안 되는 개인정보 패턴
 PII_PATTERNS = {
@@ -114,11 +118,13 @@ def clean_method(raw) -> str:
     """카드 끝자리 등을 버리고 결제수단 종류만 남긴다."""
     if not raw:
         return ""
-    s = str(raw)
+    s = str(raw).split(":")[0]                          # "Toss: 유재*" -> "Toss" (콜론 뒤는 이름/이메일/잔액)
+    s = re.sub(r"\+?\d[\d\- ]{6,}", "", s)             # 전화번호
     s = re.sub(r"[\(\[（].*?[\)\]）]", "", s)           # (1234), [끝자리 1234]
     s = re.sub(r"[-–·•*\s]*(끝자리|ending in|ending)?[\s:]*[*•x]*\d{2,}\s*$", "", s, flags=re.I)
     s = re.sub(r"[*•x]{2,}", "", s, flags=re.I)          # ••••, ****
-    return re.sub(r"\s+", " ", s).strip(" -–·")
+    s = re.sub(r"\s+", " ", s).strip(" -–·")
+    return METHOD_ALIASES.get(s, s)
 
 
 def first(d: dict, *keys):
@@ -157,14 +163,19 @@ def extract(entry: dict, idx: int, warnings: list):
     if not titles:
         warnings.append(f"항목명이 없습니다 ({ctx}).")
 
-    method = clean_method(first(o, "paymentMethodTitle", "paymentMethod"))
+    bi = o.get("billingInstrument")
+    method = clean_method(first(o, "paymentMethodTitle", "paymentMethod")
+                          or (bi.get("displayName") if isinstance(bi, dict) else None))
     if not method:
         warnings.append(f"결제수단을 찾지 못했습니다 ({ctx}).")
     elif method not in KNOWN_METHODS:
         warnings.append(f"처음 보는 결제수단입니다: {method!r} (KNOWN_METHODS에 추가하면 경고가 사라집니다)")
 
+    rcur, refund = parse_price(o.get("refundAmount"), warnings, ctx)
+    if refund and rcur != cur:
+        warnings.append(f"환불 통화가 결제 통화와 다릅니다 ({ctx}).")
     return {"date": when, "item": ", ".join(titles), "currency": cur,
-            "amount": amount, "method": method}
+            "amount": amount, "refund": refund or 0, "method": method}
 
 
 # ---------------------------------------------------------------- 엑셀
@@ -183,41 +194,49 @@ def write_excel(rows: list, out: Path):
 
     ws["A1"] = "통화별 합계"
     ws["A1"].font = Font(bold=True, size=13)
+    rng = lambda col: f"${col}${first_data}:${col}${last_data}"
     for i, cur in enumerate(currencies):
         r = 2 + i
+        fmt = "#,##0" if cur in ZERO_DECIMAL else "#,##0.00"
         ws.cell(r, 1, cur).font = BOLD
-        c = ws.cell(r, 2, f'=SUMIF($C${first_data}:$C${last_data},A{r},$D${first_data}:$D${last_data})')
-        c.number_format = "#,##0" if cur in ZERO_DECIMAL else "#,##0.00"
-        c.font = BOLD
+        ws.cell(r, 2, f"=SUMIF({rng('C')},A{r},{rng('D')})")   # 결제
+        ws.cell(r, 3, f"=SUMIF({rng('C')},A{r},{rng('E')})")   # 환불
+        ws.cell(r, 4, f"=B{r}-C{r}")                           # 순액
+        for col in (2, 3, 4):
+            ws.cell(r, col).number_format = fmt
+            ws.cell(r, col).font = BOLD
+    ws.cell(1, 2, "결제").font = BOLD
+    ws.cell(1, 3, "환불").font = BOLD
+    ws.cell(1, 4, "순액(결제-환불)").font = BOLD
 
-    for col, name in enumerate(["날짜(KST)", "항목", "통화", "금액", "결제수단"], 1):
+    for col, name in enumerate(["날짜(KST)", "항목", "통화", "결제금액", "환불금액", "결제수단"], 1):
         c = ws.cell(header_row, col, name)
         c.font, c.fill = BOLD, HEAD_FILL
     for r, row in enumerate(rows, first_data):
+        fmt = "#,##0" if row["currency"] in ZERO_DECIMAL else "#,##0.00"
         ws.cell(r, 1, row["date"]).number_format = "yyyy-mm-dd hh:mm"
         ws.cell(r, 2, row["item"])
         ws.cell(r, 3, row["currency"])
-        ws.cell(r, 4, row["amount"]).number_format = (
-            "#,##0" if row["currency"] in ZERO_DECIMAL else "#,##0.00")
-        ws.cell(r, 5, row["method"])
+        ws.cell(r, 4, row["amount"]).number_format = fmt
+        ws.cell(r, 5, row["refund"]).number_format = fmt
+        ws.cell(r, 6, row["method"])
 
-    ws.auto_filter.ref = f"A{header_row}:E{last_data}"
+    ws.auto_filter.ref = f"A{header_row}:F{last_data}"
     ws.freeze_panes = ws.cell(first_data, 1)
-    for col, width in enumerate([18, 50, 8, 14, 22], 1):
+    for col, width in enumerate([18, 50, 8, 14, 14, 22], 1):
         ws.column_dimensions[get_column_letter(col)].width = width
-    ws.cell(first_data, 2).alignment = Alignment(wrap_text=False)
 
     info = wb.create_sheet("안내")
     lines = [
         "이 파일은 구글 플레이 주문 내역에서 결제 정보만 골라 만든 것입니다.",
         "",
-        "가져온 항목: 주문 시각(한국시간), 항목명, 통화, 금액, 결제수단 종류",
-        "제거한 정보: 이름, 주소, 전화번호, 이메일, 주문번호, 카드 끝자리 등 나머지 전부",
+        "가져온 항목: 주문 시각(한국시간), 항목명, 통화, 결제금액, 환불금액, 결제수단 종류",
+        "제거한 정보: 이름, 주소, 전화번호, 이메일, IP, 주문번호, 카드 끝자리 등 나머지 전부",
         "",
         "주의사항",
         "- 금액은 숫자로 저장되어 합계·필터를 바로 쓸 수 있습니다.",
         "- 맨 위 합계는 수식(SUMIF)이라 필터를 걸어도 전체 합계가 유지됩니다.",
-        "- 환불은 음수로 들어올 수 있습니다.",
+        "- 환불된 주문은 결제금액에 그대로 남고 환불금액 열에 따로 표시됩니다. 순액 = 결제 - 환불.",
         "- 원본 JSON에는 개인정보가 들어 있으니 따로 보관하고 공유하지 마세요.",
         "- 구글이 내보내기 형식을 바꾸면 변환이 맞지 않을 수 있습니다. 경고 메시지를 확인하세요.",
     ]

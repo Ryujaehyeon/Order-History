@@ -19,7 +19,7 @@ python convert.py                               # 파일 선택창
 연습용 가짜 데이터: `python make_sample.py` → `sample_order_history.json`
 
 ## 결과물
-- **결제내역** 시트: 맨 위에 통화별 합계(SUMIF 수식), 아래에 날짜(KST)·항목·통화·금액·결제수단 표. 필터와 합계를 바로 쓸 수 있도록 금액은 숫자로 저장됩니다.
+- **결제내역** 시트: 맨 위에 통화별 합계(SUMIF 수식), 아래에 날짜(KST)·항목·통화·결제금액·환불금액·결제수단 표. 합계는 통화별로 결제/환불/순액을 보여줍니다. 필터와 합계를 바로 쓸 수 있도록 금액은 숫자로 저장됩니다.
 - **안내** 시트: 제거한 정보와 주의사항.
 
 ## 자동 검증과 경고
@@ -34,4 +34,4 @@ python convert.py                               # 파일 선택창
 ## 주의
 - 원본 JSON과 변환 결과는 개인정보가 섞일 수 있으니 공유하지 말고 따로 보관하세요. `.gitignore`가 `*.json`, `*.xlsx`를 막아 둡니다.
 - 구글이 내보내기 형식을 바꾸면 맞지 않을 수 있습니다. 경고를 확인하세요.
-- 키 이름(`creationTime`, `totalPrice`, `paymentMethodTitle`, `lineItem[].doc.title`)은 일반적인 Takeout 구조를 가정한 것입니다. 실제 파일과 다르면 `extract()`의 키 이름만 고치면 됩니다.
+- 읽는 키는 `creationTime`, `totalPrice`, `refundAmount`, `billingInstrument.displayName`, `lineItem[].doc.title`입니다. 구조가 바뀌면 `extract()`의 키 이름만 고치면 됩니다.
