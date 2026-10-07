@@ -31,12 +31,31 @@ CURRENCY_CODES = {"KRW", "USD", "JPY", "EUR", "GBP", "CAD", "AUD", "HKD", "TWD"}
 # 소수점 없는 통화
 ZERO_DECIMAL = {"KRW", "JPY", "TWD"}
 
-# 이미 알고 있는 결제수단. 여기 없는 종류가 나오면 경고합니다. 필요하면 추가하세요.
-KNOWN_METHODS = {"토스", "신한", "비씨", "Visa", "UnionPay", "KT 휴대폰", "NAVER Pay",
-                 "Google Play 잔액", "Google Play 기프트 카드"}
-# 표기 통일 (정리한 뒤의 이름 -> 최종 이름)
-METHOD_ALIASES = {"Toss": "토스", "KT": "KT 휴대폰", "Korea Telecom KR": "KT 휴대폰",
-                  "Korea Telecom": "KT 휴대폰"}
+# 결제수단: 원문(카드 끝자리·이름·전화번호·이메일이 섞여 있음)은 저장하지도 출력하지도 않고,
+# 아래 규칙에 맞는 "종류 이름"만 꺼냅니다. 규칙에 없으면 "기타"로 두고 경고합니다.
+METHOD_RULES = [
+    (re.compile(r"^\s*toss", re.I), "토스"),
+    (re.compile(r"^\s*신한"), "신한"),
+    (re.compile(r"^\s*비씨"), "비씨"),
+    (re.compile(r"^\s*visa", re.I), "Visa"),
+    (re.compile(r"^\s*unionpay", re.I), "UnionPay"),
+    (re.compile(r"^\s*(kt\b|korea telecom)", re.I), "KT 휴대폰"),
+    (re.compile(r"^\s*naver\s*pay", re.I), "NAVER Pay"),
+    (re.compile(r"^\s*google play 잔액", re.I), "Google Play 잔액"),
+]
+
+# 앱/게임 이름 통일 (표기가 둘 이상인 것만). 형식: "항목명 속 표기": "통일할 이름"
+APP_ALIASES = {
+    "소녀전선 Girls' Frontline": "소녀전선",
+    "Crusaders Quest": "크루세이더 퀘스트",
+    "명조:워더링 웨이브 × 사이버펑크 콜라보": "명조:워더링 웨이브",
+    "KakaoTalk: Free Calls & Text": "카카오톡",
+    "KakaoTalk : Messenger": "카카오톡",
+    "원신-1주년": "원신",
+    "캐치잇 잉글리시-Catch It English": "캐치잇 잉글리시",
+}
+# 항목명 모양으로 묶는 규칙: (패턴, 이름)
+APP_PATTERNS = [(re.compile(r"상당 쿠폰$"), "Google Play 쿠폰")]
 
 # 결과물에 남아 있으면 안 되는 개인정보 패턴
 PII_PATTERNS = {
@@ -114,17 +133,37 @@ def parse_price(text, warnings: list, ctx: str):
     return cur, -value if neg else value
 
 
-def clean_method(raw) -> str:
-    """카드 끝자리 등을 버리고 결제수단 종류만 남긴다."""
-    if not raw:
-        return ""
-    s = str(raw).split(":")[0]                          # "Toss: 유재*" -> "Toss" (콜론 뒤는 이름/이메일/잔액)
-    s = re.sub(r"\+?\d[\d\- ]{6,}", "", s)             # 전화번호
-    s = re.sub(r"[\(\[（].*?[\)\]）]", "", s)           # (1234), [끝자리 1234]
-    s = re.sub(r"[-–·•*\s]*(끝자리|ending in|ending)?[\s:]*[*•x]*\d{2,}\s*$", "", s, flags=re.I)
-    s = re.sub(r"[*•x]{2,}", "", s, flags=re.I)          # ••••, ****
-    s = re.sub(r"\s+", " ", s).strip(" -–·")
-    return METHOD_ALIASES.get(s, s)
+def classify_method(raw, idx: int, warnings: list) -> str:
+    """결제수단 원문에서 종류만 판별한다. 원문은 어디에도 남기지 않는다."""
+    if not isinstance(raw, str) or not raw.strip():
+        warnings.append(f"결제수단을 찾지 못했습니다 ({idx}번째 주문).")
+        return "기타"
+    for pat, label in METHOD_RULES:
+        if pat.search(raw):
+            return label
+    warnings.append(f"처음 보는 결제수단이라 '기타'로 분류했습니다 ({idx}번째 주문). "
+                    "개인정보 보호를 위해 원문은 표시하지 않습니다. 필요하면 METHOD_RULES에 규칙을 추가하세요.")
+    return "기타"
+
+
+def app_name(title: str, doc_type) -> str:
+    """'상품명 (앱·게임 이름 - 부가설명)' 에서 앱/게임 이름을 꺼낸다."""
+    t = title.strip()
+    if t.endswith(")"):
+        depth = 0
+        for i in range(len(t) - 1, -1, -1):          # 끝의 괄호와 짝이 맞는 여는 괄호 찾기
+            depth += (t[i] == ")") - (t[i] == "(")
+            if depth == 0:
+                name = t[i + 1:-1].split(" - ")[0].strip()
+                if name:
+                    return APP_ALIASES.get(name, name)
+                break
+    if t.startswith("Google Play 잔액"):
+        return "Google Play 잔액 충전"
+    for pat, label in APP_PATTERNS:
+        if pat.search(t):
+            return label
+    return APP_ALIASES.get(t, t)                    # 괄호가 없으면 항목명 자체가 앱/구독/도서 이름
 
 
 def first(d: dict, *keys):
@@ -154,33 +193,36 @@ def extract(entry: dict, idx: int, warnings: list):
         warnings.append(f"금액이 없어 건너뜁니다 ({ctx}).")
         return None
 
-    titles = []
+    titles, apps = [], []
     for li in o.get("lineItem") or []:
         doc = li.get("doc") if isinstance(li, dict) else None
-        title = (doc or {}).get("title") if isinstance(doc, dict) else None
-        if title and title not in titles:
-            titles.append(title)
+        title = doc.get("title") if isinstance(doc, dict) else None
+        if title:
+            if title not in titles:
+                titles.append(title)
+            a = app_name(title, doc.get("documentType"))
+            if a not in apps:
+                apps.append(a)
     if not titles:
         warnings.append(f"항목명이 없습니다 ({ctx}).")
 
     bi = o.get("billingInstrument")
-    method = clean_method(first(o, "paymentMethodTitle", "paymentMethod")
-                          or (bi.get("displayName") if isinstance(bi, dict) else None))
-    if not method:
-        warnings.append(f"결제수단을 찾지 못했습니다 ({ctx}).")
-    elif method not in KNOWN_METHODS:
-        warnings.append(f"처음 보는 결제수단입니다: {method!r} (KNOWN_METHODS에 추가하면 경고가 사라집니다)")
+    method = classify_method(bi.get("displayName") if isinstance(bi, dict) else None, idx, warnings)
 
     rcur, refund = parse_price(o.get("refundAmount"), warnings, ctx)
     if refund and rcur != cur:
         warnings.append(f"환불 통화가 결제 통화와 다릅니다 ({ctx}).")
-    return {"date": when, "item": ", ".join(titles), "currency": cur,
-            "amount": amount, "refund": refund or 0, "method": method}
+    return {"date": when, "item": ", ".join(titles), "app": ", ".join(apps) or "(이름 없음)",
+            "currency": cur, "amount": amount, "refund": refund or 0, "method": method}
 
 
 # ---------------------------------------------------------------- 엑셀
 HEAD_FILL = PatternFill("solid", fgColor="DDEBF7")
 BOLD = Font(bold=True)
+
+
+def money_fmt(cur):
+    return "#,##0" if cur in ZERO_DECIMAL else "#,##0.00"
 
 
 def write_excel(rows: list, out: Path):
@@ -191,51 +233,76 @@ def write_excel(rows: list, out: Path):
     currencies = sorted({r["currency"] for r in rows})
     header_row = 3 + len(currencies) + 1          # 합계 블록 아래 한 줄 띄우고 표 시작
     first_data, last_data = header_row + 1, header_row + len(rows)
+    # 열: A 날짜 / B 항목 / C 앱·게임 / D 통화 / E 결제금액 / F 환불금액 / G 결제수단
+    rng = lambda col: f"${col}${first_data}:${col}${last_data}"
 
     ws["A1"] = "통화별 합계"
     ws["A1"].font = Font(bold=True, size=13)
-    rng = lambda col: f"${col}${first_data}:${col}${last_data}"
+    for col, name in ((2, "결제"), (3, "환불"), (4, "순액(결제-환불)")):
+        ws.cell(1, col, name).font = BOLD
     for i, cur in enumerate(currencies):
         r = 2 + i
-        fmt = "#,##0" if cur in ZERO_DECIMAL else "#,##0.00"
         ws.cell(r, 1, cur).font = BOLD
-        ws.cell(r, 2, f"=SUMIF({rng('C')},A{r},{rng('D')})")   # 결제
-        ws.cell(r, 3, f"=SUMIF({rng('C')},A{r},{rng('E')})")   # 환불
-        ws.cell(r, 4, f"=B{r}-C{r}")                           # 순액
+        ws.cell(r, 2, f"=SUMIF({rng('D')},A{r},{rng('E')})")
+        ws.cell(r, 3, f"=SUMIF({rng('D')},A{r},{rng('F')})")
+        ws.cell(r, 4, f"=B{r}-C{r}")
         for col in (2, 3, 4):
-            ws.cell(r, col).number_format = fmt
+            ws.cell(r, col).number_format = money_fmt(cur)
             ws.cell(r, col).font = BOLD
-    ws.cell(1, 2, "결제").font = BOLD
-    ws.cell(1, 3, "환불").font = BOLD
-    ws.cell(1, 4, "순액(결제-환불)").font = BOLD
 
-    for col, name in enumerate(["날짜(KST)", "항목", "통화", "결제금액", "환불금액", "결제수단"], 1):
+    for col, name in enumerate(["날짜(KST)", "항목", "앱/게임", "통화", "결제금액", "환불금액", "결제수단"], 1):
         c = ws.cell(header_row, col, name)
         c.font, c.fill = BOLD, HEAD_FILL
     for r, row in enumerate(rows, first_data):
-        fmt = "#,##0" if row["currency"] in ZERO_DECIMAL else "#,##0.00"
         ws.cell(r, 1, row["date"]).number_format = "yyyy-mm-dd hh:mm"
         ws.cell(r, 2, row["item"])
-        ws.cell(r, 3, row["currency"])
-        ws.cell(r, 4, row["amount"]).number_format = fmt
-        ws.cell(r, 5, row["refund"]).number_format = fmt
-        ws.cell(r, 6, row["method"])
-
-    ws.auto_filter.ref = f"A{header_row}:F{last_data}"
+        ws.cell(r, 3, row["app"])
+        ws.cell(r, 4, row["currency"])
+        ws.cell(r, 5, row["amount"]).number_format = money_fmt(row["currency"])
+        ws.cell(r, 6, row["refund"]).number_format = money_fmt(row["currency"])
+        ws.cell(r, 7, row["method"])
+    ws.auto_filter.ref = f"A{header_row}:G{last_data}"
     ws.freeze_panes = ws.cell(first_data, 1)
-    for col, width in enumerate([18, 50, 8, 14, 14, 22], 1):
+    for col, width in enumerate([18, 50, 26, 8, 14, 14, 16], 1):
         ws.column_dimensions[get_column_letter(col)].width = width
+
+    # 앱/게임 x 통화별 합계 (표의 SUMIFS 수식이라 원본 표를 고치면 같이 바뀜)
+    pairs = {}
+    for r in rows:
+        k = (r["app"], r["currency"])
+        pairs[k] = pairs.get(k, 0) + r["amount"] - r["refund"]
+    order = sorted(pairs, key=lambda k: (k[1], -pairs[k], k[0]))
+    ap = wb.create_sheet("앱별")
+    for col, name in enumerate(["앱/게임", "통화", "건수", "결제", "환불", "순액"], 1):
+        c = ap.cell(1, col, name)
+        c.font, c.fill = BOLD, HEAD_FILL
+    for r, (app, cur) in enumerate(order, 2):
+        crit = f"'결제내역'!{rng('C')},$A{r},'결제내역'!{rng('D')},$B{r}"
+        ap.cell(r, 1, app)
+        ap.cell(r, 2, cur)
+        ap.cell(r, 3, f"=COUNTIFS({crit})")
+        ap.cell(r, 4, f"=SUMIFS('결제내역'!{rng('E')},{crit})")
+        ap.cell(r, 5, f"=SUMIFS('결제내역'!{rng('F')},{crit})")
+        ap.cell(r, 6, f"=D{r}-E{r}")
+        for col in (4, 5, 6):
+            ap.cell(r, col).number_format = money_fmt(cur)
+    ap.auto_filter.ref = f"A1:F{len(order) + 1}"
+    ap.freeze_panes = "A2"
+    for col, width in enumerate([40, 8, 8, 14, 14, 14], 1):
+        ap.column_dimensions[get_column_letter(col)].width = width
 
     info = wb.create_sheet("안내")
     lines = [
         "이 파일은 구글 플레이 주문 내역에서 결제 정보만 골라 만든 것입니다.",
         "",
-        "가져온 항목: 주문 시각(한국시간), 항목명, 통화, 결제금액, 환불금액, 결제수단 종류",
+        "가져온 항목: 주문 시각(한국시간), 항목명, 앱/게임 이름, 통화, 결제금액, 환불금액, 결제수단 종류",
         "제거한 정보: 이름, 주소, 전화번호, 이메일, IP, 주문번호, 카드 끝자리 등 나머지 전부",
+        "결제수단은 원문(카드번호 끝자리·이름·전화번호 등이 섞여 있음)을 읽어 저장하지 않고 종류만 분류합니다.",
         "",
         "주의사항",
+        "- 앱/게임 이름은 항목명 끝의 괄호 안 이름에서 뽑았습니다. 같은 앱의 다른 표기는 APP_ALIASES로 합칩니다.",
         "- 금액은 숫자로 저장되어 합계·필터를 바로 쓸 수 있습니다.",
-        "- 맨 위 합계는 수식(SUMIF)이라 필터를 걸어도 전체 합계가 유지됩니다.",
+        "- 합계와 앱별 시트는 수식이라 표를 고치면 함께 바뀝니다.",
         "- 환불된 주문은 결제금액에 그대로 남고 환불금액 열에 따로 표시됩니다. 순액 = 결제 - 환불.",
         "- 원본 JSON에는 개인정보가 들어 있으니 따로 보관하고 공유하지 마세요.",
         "- 구글이 내보내기 형식을 바꾸면 변환이 맞지 않을 수 있습니다. 경고 메시지를 확인하세요.",
@@ -243,8 +310,8 @@ def write_excel(rows: list, out: Path):
     for i, line in enumerate(lines, 1):
         info.cell(i, 1, line)
     info["A1"].font = BOLD
-    info["A6"].font = BOLD
-    info.column_dimensions["A"].width = 80
+    info["A7"].font = BOLD
+    info.column_dimensions["A"].width = 90
     wb.save(out)
 
 
@@ -278,8 +345,8 @@ def verify(out: Path, rows: list, raw_orders: list, warnings: list) -> bool:
     sheet = Counter()
     ws = wb["결제내역"]
     for r in ws.iter_rows(values_only=True):
-        if isinstance(r[3], (int, float)) and isinstance(r[2], str) and len(r[2]) == 3:
-            sheet[r[2]] += r[3]
+        if isinstance(r[4], (int, float)) and isinstance(r[3], str) and len(r[3]) == 3:
+            sheet[r[3]] += r[4]
     for cur in sorted(set(raw) | set(sheet)):
         if abs(raw[cur] - sheet[cur]) > 0.005:
             print(f"[검증 실패] {cur} 합계 불일치: 원본 {raw[cur]:,.2f} / 엑셀 {sheet[cur]:,.2f}")
